@@ -1,0 +1,40 @@
+{
+  "name": "calibre-manager-mcp",
+  "version": "0.1.0",
+  "description": "MCP server to manage and organize a Calibre e-book library (reading + writing metadata) through the official calibredb command.",
+  "type": "module",
+  "bin": {
+    "calibre-manager-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    ".env.example"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js",
+    "prepare": "tsc"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "calibre",
+    "ebook",
+    "calibredb",
+    "metadata"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "typescript": "^5.5.4"
+  }
+}
