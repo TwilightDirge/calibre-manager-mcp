@@ -19,7 +19,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { writeFileSync, existsSync } from "node:fs";
+import { writeFileSync, existsSync, mkdtempSync, readFileSync, statSync} from "node:fs";
 
 import {
   CONFIG,
@@ -32,14 +32,20 @@ import {
 
 const server = new McpServer({ name: "calibre-manager", version: "0.1.0" });
 
-type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
+type TextContent = { type: "text"; text: string };
+type ImageContent = { type: "image"; data: string; mimeType: string };
+type ToolResult = { content: (TextContent | ImageContent)[]; isError?: boolean };
 
 const ok = (text: string): ToolResult => ({ content: [{ type: "text", text }] });
 
-/** Wraps a handler: returns text or a readable error (isError) without crashing the server. */
-async function guard(fn: () => Promise<string>): Promise<ToolResult> {
+/**
+ * Wraps a handler: returns text (or a ready-made result, e.g. text plus an
+ * image) or a readable error (isError) without crashing the server.
+ */
+async function guard(fn: () => Promise<string | ToolResult>): Promise<ToolResult> {
   try {
-    return ok(await fn());
+    const out = await fn();
+    return typeof out === "string" ? ok(out) : out;
   } catch (err: any) {
     return { content: [{ type: "text", text: String(err?.message ?? err) }], isError: true };
   }
@@ -364,30 +370,20 @@ server.tool(
 );
 
 // --------------------------------------------------------------------------- //
-// Online metadata  (replacement for the existing fetch_online_metadata tool)
+// Online metadata
 // --------------------------------------------------------------------------- //
 //
-// Before using this, add these names to the file's existing "fs" import:
-//   mkdtempSync, readFileSync, statSync
-// e.g.
-//   import { existsSync, writeFileSync, mkdtempSync, readFileSync, statSync } from "fs";
-//
-// Changes from the original:
-//   1. Each call saves the cover to its own new temp folder, so an old image can
-//      never be picked up by a later lookup.
-//   2. When fetch_cover is true (and apply_to_book_id isn't set), the cover image
-//      is returned with the OPF, along with a cover_path that can be passed to
-//      set_metadata's "cover" field.
-//   3. If no cover was downloaded, the result says so instead of giving a path.
-//   4. Optional "sources" parameter to limit which metadata sources are used.
-//      Check that your Calibre version supports --allowed-plugin by running
-//      "fetch-ebook-metadata --help"; if it doesn't, delete the "sources" lines.
+// fetch_online_metadata saves each cover to its own new temp folder (so an old
+// image can never be reused by a later lookup), returns the cover image with the
+// OPF so it can be checked before use, and says so when no cover was found.
+// "sources" limits which metadata sources are used (fetch-ebook-metadata
+// --allowed-plugin).
 
 const MAX_IMAGE_BYTES = 3_000_000; // don't attach unusually large images
 
 // Work out the real image type from the file's first bytes; the file is always
 // named cover.jpg, but some sources supply PNG or WebP.
-function imageMimeType(buf) {
+function imageMimeType(buf: Buffer): string | null {
     if (buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47)
         return "image/png";
     if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff)
@@ -409,7 +405,7 @@ server.tool("fetch_online_metadata", "Looks up metadata from online sources by t
 }, async ({ title, authors, isbn, apply_to_book_id, fetch_cover, sources }) => guard(async () => {
     if (!title && !isbn)
         throw new Error("Provide at least a title or an ISBN.");
-    const args = ["--opf"];
+    const args: string[] = ["--opf"];
     if (title)
         args.push("--title", title);
     if (authors)
@@ -417,7 +413,7 @@ server.tool("fetch_online_metadata", "Looks up metadata from online sources by t
     if (isbn)
         args.push("--isbn", isbn);
     if (sources) {
-        for (const s of sources.split(",").map((x) => x.trim()).filter(Boolean))
+        for (const s of sources.split(",").map((x: string) => x.trim()).filter(Boolean))
             args.push("--allowed-plugin", s);
     }
 
@@ -433,7 +429,7 @@ server.tool("fetch_online_metadata", "Looks up metadata from online sources by t
 
     // Lookup only: return the OPF plus (optionally) the cover image.
     if (!apply_to_book_id) {
-        const content = [{ type: "text", text: opf }];
+        const content: ToolResult["content"] = [{ type: "text", text: opf }];
         if (fetch_cover) {
             if (!haveCover) {
                 content.push({ type: "text", text: "cover: none found" });
@@ -454,7 +450,7 @@ server.tool("fetch_online_metadata", "Looks up metadata from online sources by t
     const opfPath = join(tmpdir(), `calibre_meta_${apply_to_book_id}.opf`);
     writeFileSync(opfPath, opf, "utf8");
     await calibredb(["set_metadata", String(apply_to_book_id), opfPath]);
-    const result = { applied_to: apply_to_book_id };
+    const result: Record<string, unknown> = { applied_to: apply_to_book_id };
     if (haveCover) {
         await calibredb(["set_metadata", String(apply_to_book_id), "--field", `cover:${coverPath}`]);
         result.cover_set = true;
