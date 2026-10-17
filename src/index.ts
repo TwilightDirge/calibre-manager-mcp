@@ -364,47 +364,105 @@ server.tool(
 );
 
 // --------------------------------------------------------------------------- //
-// Online metadata
+// Online metadata  (replacement for the existing fetch_online_metadata tool)
 // --------------------------------------------------------------------------- //
-server.tool(
-  "fetch_online_metadata",
-  "Looks up metadata from online sources (Google Books, etc.) by title/author or ISBN and returns an OPF. If you pass apply_to_book_id, it applies that metadata (and optionally the cover) to that book in your library.",
-  {
+//
+// Before using this, add these names to the file's existing "fs" import:
+//   mkdtempSync, readFileSync, statSync
+// e.g.
+//   import { existsSync, writeFileSync, mkdtempSync, readFileSync, statSync } from "fs";
+//
+// Changes from the original:
+//   1. Each call saves the cover to its own new temp folder, so an old image can
+//      never be picked up by a later lookup.
+//   2. When fetch_cover is true (and apply_to_book_id isn't set), the cover image
+//      is returned with the OPF, along with a cover_path that can be passed to
+//      set_metadata's "cover" field.
+//   3. If no cover was downloaded, the result says so instead of giving a path.
+//   4. Optional "sources" parameter to limit which metadata sources are used.
+//      Check that your Calibre version supports --allowed-plugin by running
+//      "fetch-ebook-metadata --help"; if it doesn't, delete the "sources" lines.
+
+const MAX_IMAGE_BYTES = 3_000_000; // don't attach unusually large images
+
+// Work out the real image type from the file's first bytes; the file is always
+// named cover.jpg, but some sources supply PNG or WebP.
+function imageMimeType(buf) {
+    if (buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47)
+        return "image/png";
+    if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff)
+        return "image/jpeg";
+    if (buf.length >= 12 && buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP")
+        return "image/webp";
+    if (buf.length >= 3 && buf.toString("ascii", 0, 3) === "GIF")
+        return "image/gif";
+    return null;
+}
+
+server.tool("fetch_online_metadata", "Looks up metadata from online sources by title/author or ISBN and returns an OPF. With fetch_cover=true, also returns the downloaded cover image and a unique cover_path that can be passed to set_metadata's cover field. If you pass apply_to_book_id, it applies that metadata (and optionally the cover) to that book in your library.", {
     title: z.string().optional(),
     authors: z.string().optional(),
     isbn: z.string().optional(),
     apply_to_book_id: z.number().int().optional().describe("If set, applies the metadata to that book."),
     fetch_cover: z.boolean().optional().describe("true to also download the cover."),
-  },
-  async ({ title, authors, isbn, apply_to_book_id, fetch_cover }) =>
-    guard(async () => {
-      if (!title && !isbn) throw new Error("Provide at least a title or an ISBN.");
-      const args = ["--opf"];
-      if (title) args.push("--title", title);
-      if (authors) args.push("--authors", authors);
-      if (isbn) args.push("--isbn", isbn);
-      let coverPath = "";
-      if (fetch_cover) {
-        coverPath = join(tmpdir(), "calibre_fetch_cover.jpg");
+    sources: z.string().optional().describe("Comma-separated metadata source names to use, e.g. 'Goodreads,FictionDB'. Default: all enabled sources."),
+}, async ({ title, authors, isbn, apply_to_book_id, fetch_cover, sources }) => guard(async () => {
+    if (!title && !isbn)
+        throw new Error("Provide at least a title or an ISBN.");
+    const args = ["--opf"];
+    if (title)
+        args.push("--title", title);
+    if (authors)
+        args.push("--authors", authors);
+    if (isbn)
+        args.push("--isbn", isbn);
+    if (sources) {
+        for (const s of sources.split(",").map((x) => x.trim()).filter(Boolean))
+            args.push("--allowed-plugin", s);
+    }
+
+    let coverPath = "";
+    if (fetch_cover) {
+        const dir = mkdtempSync(join(tmpdir(), "calibre-cover-"));
+        coverPath = join(dir, "cover.jpg");
         args.push("--cover", coverPath);
-      }
-      const opf = await run(CONFIG.fetchMeta, args, { timeout: 180_000 });
-      if (!apply_to_book_id) return opf;
+    }
 
-      const opfPath = join(tmpdir(), `calibre_meta_${apply_to_book_id}.opf`);
-      writeFileSync(opfPath, opf, "utf8");
-      await calibredb(["set_metadata", String(apply_to_book_id), opfPath]);
+    const opf = await run(CONFIG.fetchMeta, args, { timeout: 180_000 });
+    const haveCover = coverPath !== "" && existsSync(coverPath) && statSync(coverPath).size > 0;
 
-      const result: Record<string, unknown> = { applied_to: apply_to_book_id };
-      if (coverPath && existsSync(coverPath)) {
+    // Lookup only: return the OPF plus (optionally) the cover image.
+    if (!apply_to_book_id) {
+        const content = [{ type: "text", text: opf }];
+        if (fetch_cover) {
+            if (!haveCover) {
+                content.push({ type: "text", text: "cover: none found" });
+            } else {
+                const buf = readFileSync(coverPath);
+                const mimeType = imageMimeType(buf);
+                content.push({ type: "text", text: `cover_path: ${coverPath}` });
+                if (mimeType && buf.length <= MAX_IMAGE_BYTES)
+                    content.push({ type: "image", data: buf.toString("base64"), mimeType });
+                else
+                    content.push({ type: "text", text: "cover image not attached (unrecognised format or too large)" });
+            }
+        }
+        return { content };
+    }
+
+    // Apply to a book (unchanged behaviour, but uses this call's own cover file).
+    const opfPath = join(tmpdir(), `calibre_meta_${apply_to_book_id}.opf`);
+    writeFileSync(opfPath, opf, "utf8");
+    await calibredb(["set_metadata", String(apply_to_book_id), opfPath]);
+    const result = { applied_to: apply_to_book_id };
+    if (haveCover) {
         await calibredb(["set_metadata", String(apply_to_book_id), "--field", `cover:${coverPath}`]);
         result.cover_set = true;
-      }
-      const books = await booksFrom(`id:${apply_to_book_id}`, "all");
-      result.metadata = books[0] ?? null;
-      return J(result);
-    }),
-);
+    }
+    const books = await booksFrom(`id:${apply_to_book_id}`, "all");
+    result.metadata = books[0] ?? null;
+    return J(result);
+}));
 
 // --------------------------------------------------------------------------- //
 // Startup
