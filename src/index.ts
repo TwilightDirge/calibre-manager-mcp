@@ -104,6 +104,57 @@ server.tool(
     }),
 );
 
+// Returns the cover image currently stored in the library for each book, so
+// covers can be checked visually (e.g. to spot covers generated from a
+// file's first page). Read-only: nothing in the library is changed.
+const MAX_COVERS_PER_CALL = 8;
+const MAX_LIBRARY_COVER_BYTES = 3_000_000;
+
+server.tool(
+  "get_covers",
+  `Returns the current library cover image for up to ${MAX_COVERS_PER_CALL} books, each labelled with its id and title. Read-only. Pass ids comma-separated, e.g. '6,8,9'.`,
+  {
+    book_ids: z.string().describe(`Comma-separated book ids (max ${MAX_COVERS_PER_CALL}).`),
+  },
+  async ({ book_ids }) =>
+    guard(async () => {
+      const ids = book_ids
+        .split(",")
+        .map((s: string) => s.trim())
+        .filter(Boolean);
+      if (!ids.length) throw new Error("Provide at least one book id.");
+      if (ids.length > MAX_COVERS_PER_CALL)
+        throw new Error(`At most ${MAX_COVERS_PER_CALL} ids per call.`);
+      if (ids.some((s: string) => !/^\d+$/.test(s)))
+        throw new Error("Book ids must be whole numbers.");
+
+      const content: ToolResult["content"] = [];
+      for (const id of ids) {
+        const books = await booksFrom(`id:${id}`, "id,title,cover");
+        const book = books[0];
+        if (!book) {
+          content.push({ type: "text", text: `#${id}: no book with this id` });
+          continue;
+        }
+        const label = `#${id}: ${book.title ?? "(no title)"}`;
+        const coverPath = typeof book.cover === "string" ? book.cover : "";
+        if (!coverPath || !existsSync(coverPath)) {
+          content.push({ type: "text", text: `${label}: no cover` });
+          continue;
+        }
+        const buf = readFileSync(coverPath);
+        const mimeType = imageMimeType(buf);
+        if (!mimeType || buf.length > MAX_LIBRARY_COVER_BYTES) {
+          content.push({ type: "text", text: `${label}: cover not attached (unrecognised format or too large)` });
+          continue;
+        }
+        content.push({ type: "text", text: label });
+        content.push({ type: "image", data: buf.toString("base64"), mimeType });
+      }
+      return { content };
+    }),
+);
+
 server.tool(
   "list_categories",
   "Lists the values of a category with their book counts, as CSV. category accepts: tags, authors, series, publisher, languages, formats, rating, identifiers.",
