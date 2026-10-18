@@ -234,7 +234,8 @@ server.tool(
         scanned++;
 
         const hash = createHash("sha256").update(buf).digest("hex");
-        const entry = byHash.get(hash) ?? { ids: [], titles: [], path: coverPath };
+        const entry: { ids: number[]; titles: string[]; path: string } =
+          byHash.get(hash) ?? { ids: [], titles: [], path: coverPath };
         entry.ids.push(Number(book.id));
         entry.titles.push(String(book.title ?? ""));
         byHash.set(hash, entry);
