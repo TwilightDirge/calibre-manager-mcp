@@ -19,6 +19,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { writeFileSync, existsSync, mkdtempSync, readFileSync, statSync} from "node:fs";
 
 import {
@@ -151,6 +152,133 @@ server.tool(
         content.push({ type: "text", text: label });
         content.push({ type: "image", data: buf.toString("base64"), mimeType });
       }
+      return { content };
+    }),
+);
+
+// Reads an image's width and height from its header (JPEG, PNG, GIF, WebP)
+// without decoding it. Returns null if the format isn't recognised.
+function imageSize(buf: Buffer): { width: number; height: number } | null {
+  try {
+    const type = imageMimeType(buf);
+    if (type === "image/png" && buf.length >= 24)
+      return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+    if (type === "image/gif" && buf.length >= 10)
+      return { width: buf.readUInt16LE(6), height: buf.readUInt16LE(8) };
+    if (type === "image/webp" && buf.length >= 30) {
+      const chunk = buf.toString("ascii", 12, 16);
+      if (chunk === "VP8 ")
+        return { width: buf.readUInt16LE(26) & 0x3fff, height: buf.readUInt16LE(28) & 0x3fff };
+      if (chunk === "VP8L") {
+        const bits = buf.readUInt32LE(21);
+        return { width: (bits & 0x3fff) + 1, height: ((bits >> 14) & 0x3fff) + 1 };
+      }
+      if (chunk === "VP8X")
+        return { width: buf.readUIntLE(24, 3) + 1, height: buf.readUIntLE(27, 3) + 1 };
+      return null;
+    }
+    if (type === "image/jpeg") {
+      let i = 2;
+      while (i + 9 < buf.length) {
+        if (buf[i] !== 0xff) { i++; continue; }
+        const marker = buf[i + 1];
+        if (marker === 0xff) { i++; continue; }
+        if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { i += 2; continue; }
+        const segLength = buf.readUInt16BE(i + 2);
+        const isSof = marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+        if (isSof) return { height: buf.readUInt16BE(i + 5), width: buf.readUInt16BE(i + 7) };
+        i += 2 + segLength;
+      }
+    }
+  } catch {
+    // Truncated or malformed header: treat as unknown.
+  }
+  return null;
+}
+
+// Scans library covers in one pass. Groups books whose cover files are
+// byte-for-byte identical (e.g. a "Microsoft Word" splash used on many books)
+// and lists covers with page-like proportions (e.g. a PDF page used as a
+// cover). Read-only: nothing in the library is changed.
+server.tool(
+  "scan_covers",
+  "Scans library covers (read-only). Returns groups of books sharing an identical cover image, with one sample image per group, and a list of covers whose width/height ratio looks like a printed page rather than a book cover. Optionally limit the scan with a Calibre query.",
+  {
+    query: z.string().optional().describe("Calibre query to limit the scan, e.g. 'formats:pdf'. Default: whole library."),
+    min_group: z.number().int().min(2).optional().describe("Smallest number of books sharing a cover to report as a group (default 2)."),
+    max_samples: z.number().int().min(0).max(20).optional().describe("How many groups get a sample image, largest groups first (default 12)."),
+    page_ratio: z.number().optional().describe("Width/height ratio at or above which a cover counts as page-shaped (default 0.72; book covers are usually 0.60-0.70, a US Letter page is 0.77)."),
+  },
+  async ({ query, min_group, max_samples, page_ratio }) =>
+    guard(async () => {
+      const minGroup = min_group ?? 2;
+      const maxSamples = max_samples ?? 12;
+      const ratioLimit = page_ratio ?? 0.72;
+
+      const books = await booksFrom(query ?? "", "id,title,cover");
+      const byHash = new Map<string, { ids: number[]; titles: string[]; path: string }>();
+      const pageShaped: { id: number; title: string; width: number; height: number; ratio: number }[] = [];
+      let scanned = 0;
+      let unreadable = 0;
+
+      for (const book of books) {
+        const coverPath = typeof book.cover === "string" ? book.cover : "";
+        if (!coverPath || !existsSync(coverPath)) continue;
+        let buf: Buffer;
+        try {
+          buf = readFileSync(coverPath);
+        } catch {
+          unreadable++;
+          continue;
+        }
+        scanned++;
+
+        const hash = createHash("sha256").update(buf).digest("hex");
+        const entry = byHash.get(hash) ?? { ids: [], titles: [], path: coverPath };
+        entry.ids.push(Number(book.id));
+        entry.titles.push(String(book.title ?? ""));
+        byHash.set(hash, entry);
+
+        const size = imageSize(buf);
+        if (size && size.height > 0) {
+          const ratio = size.width / size.height;
+          if (ratio >= ratioLimit)
+            pageShaped.push({ id: Number(book.id), title: String(book.title ?? ""), width: size.width, height: size.height, ratio: Math.round(ratio * 1000) / 1000 });
+        }
+      }
+
+      const groups = [...byHash.values()]
+        .filter((g) => g.ids.length >= minGroup)
+        .sort((a, b) => b.ids.length - a.ids.length);
+
+      const content: ToolResult["content"] = [];
+      content.push({
+        type: "text",
+        text: J({
+          books_checked: books.length,
+          covers_scanned: scanned,
+          unreadable_covers: unreadable,
+          identical_cover_groups: groups.map((g, n) => ({
+            group: n + 1,
+            count: g.ids.length,
+            ids: g.ids,
+            sample_titles: g.titles.slice(0, 3),
+          })),
+          page_shaped_covers: pageShaped.sort((a, b) => b.ratio - a.ratio),
+        }),
+      });
+
+      groups.slice(0, maxSamples).forEach((g, n) => {
+        const buf = readFileSync(g.path);
+        const mimeType = imageMimeType(buf);
+        if (!mimeType || buf.length > MAX_LIBRARY_COVER_BYTES) {
+          content.push({ type: "text", text: `Group ${n + 1} (${g.ids.length} books): sample not attached` });
+          return;
+        }
+        content.push({ type: "text", text: `Group ${n + 1} (${g.ids.length} books), sample from #${g.ids[0]}:` });
+        content.push({ type: "image", data: buf.toString("base64"), mimeType });
+      });
+
       return { content };
     }),
 );
