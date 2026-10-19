@@ -2,17 +2,14 @@
  * Calibre access layer.
  *
  * Every operation runs the official `calibredb` command (and `ebook-convert` /
- * `fetch-ebook-metadata`) through execFile. This is the supported, safe way to
+ * `calibre-debug`) as a child process. This is the supported, safe way to
  * read and write the library: it never touches metadata.db directly, which
  * avoids corruption and conflicts with a running Calibre app.
  */
 
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
-
-const execFileAsync = promisify(execFile);
+import { basename, resolve } from "node:path";
 
 /** Loads a simple .env (KEY=VALUE) from the working directory without overriding
  *  variables already present in the environment. A convenience for local use. */
@@ -63,31 +60,157 @@ export interface RunOptions {
   timeout?: number;
 }
 
-/** Runs a binary and returns its stdout. Throws an Error with a clear message on failure. */
-export async function run(file: string, args: string[], opts: RunOptions = {}): Promise<string> {
-  try {
-    const { stdout } = await execFileAsync(file, args, {
-      timeout: opts.timeout ?? 120_000,
-      maxBuffer: 64 * 1024 * 1024,
-      encoding: "utf8",
+const DEFAULT_TIMEOUT_MS = 120_000;
+const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+/** After a kill, how long to wait for the process to exit before giving up on it. */
+const KILL_GRACE_MS = 10_000;
+/** Longest piece of a single argument written to the log. */
+const LOG_ARG_CHARS = 120;
+
+function logLine(text: string): void {
+  console.error(`${new Date().toISOString()} [calibre-manager] ${text}`);
+}
+
+/** A readable, log-safe version of a command line: the password is masked and
+ *  long arguments (descriptions, OPF paths) are shortened. */
+function describeCommand(file: string, args: string[]): string {
+  const parts = args.map((arg, i) => {
+    if (i > 0 && args[i - 1] === "--password") return "***";
+    const short = arg.length > LOG_ARG_CHARS ? `${arg.slice(0, LOG_ARG_CHARS)}...` : arg;
+    return /[\s"]/.test(short) ? JSON.stringify(short) : short;
+  });
+  return [basename(file), ...parts].join(" ");
+}
+
+/** Ends the process and anything it started. On Windows, killing calibredb.exe
+ *  alone can leave helper processes behind that keep the library locked. */
+function killTree(child: ChildProcess): void {
+  if (child.pid === undefined || child.exitCode !== null) return;
+  if (process.platform === "win32") {
+    const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+      stdio: "ignore",
       windowsHide: true,
     });
-    return stdout;
-  } catch (err: any) {
-    if (err?.code === "ENOENT") {
+    killer.on("error", () => child.kill());
+  } else {
+    child.kill("SIGKILL");
+  }
+}
+
+type RunOutcome = {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+  overflow: boolean;
+  abandoned: boolean;
+  spawnError?: NodeJS.ErrnoException;
+};
+
+function execute(file: string, args: string[], timeoutMs: number): Promise<RunOutcome> {
+  return new Promise((settle) => {
+    const outChunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
+    let size = 0;
+    let timedOut = false;
+    let overflow = false;
+    let done = false;
+    let graceTimer: NodeJS.Timeout | undefined;
+
+    const finish = (outcome: Omit<RunOutcome, "stdout" | "stderr" | "timedOut" | "overflow">) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
+      settle({
+        ...outcome,
+        stdout: Buffer.concat(outChunks).toString("utf8"),
+        stderr: Buffer.concat(errChunks).toString("utf8"),
+        timedOut,
+        overflow,
+      });
+    };
+
+    let child: ChildProcess;
+    try {
+      // stdin is "ignore": a child can never wait for input, and can never read
+      // from this server's own stdin, which carries the MCP messages.
+      child = spawn(file, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, shell: false });
+    } catch (err: any) {
+      done = true;
+      settle({ code: null, stdout: "", stderr: "", timedOut, overflow, abandoned: false, spawnError: err });
+      return;
+    }
+
+    // Kill the process, then stop waiting for it if it still hasn't exited, so
+    // a stuck child can never leave a tool call hanging.
+    const stop = () => {
+      killTree(child);
+      graceTimer = setTimeout(() => finish({ code: null, abandoned: true }), KILL_GRACE_MS);
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      stop();
+    }, timeoutMs);
+
+    const collect = (chunks: Buffer[]) => (chunk: Buffer) => {
+      if (overflow) return;
+      size += chunk.length;
+      if (size > MAX_OUTPUT_BYTES) {
+        overflow = true;
+        stop();
+        return;
+      }
+      chunks.push(chunk);
+    };
+    child.stdout?.on("data", collect(outChunks));
+    child.stderr?.on("data", collect(errChunks));
+    child.on("error", (err) => finish({ code: null, abandoned: false, spawnError: err }));
+    child.on("close", (code) => finish({ code, abandoned: false }));
+    // After a kill, return as soon as the process itself has exited, even if
+    // a leftover helper process still holds its output pipes open.
+    child.on("exit", (code) => {
+      if (timedOut || overflow) finish({ code, abandoned: false });
+    });
+  });
+}
+
+/** Runs a binary and returns its stdout. Throws an Error with a clear message on failure. */
+export async function run(file: string, args: string[], opts: RunOptions = {}): Promise<string> {
+  const timeoutMs = opts.timeout ?? DEFAULT_TIMEOUT_MS;
+  const command = describeCommand(file, args);
+  const started = Date.now();
+  logLine(`exec start: ${command}`);
+  const r = await execute(file, args, timeoutMs);
+  const elapsed = Date.now() - started;
+  const status = r.spawnError ? `spawn error ${r.spawnError.code ?? ""}`.trim()
+    : r.timedOut ? "timed out"
+    : r.overflow ? "output too large"
+    : `exit ${r.code}`;
+  logLine(`exec end: ${basename(file)} ${status}${r.abandoned ? " (process did not exit after kill)" : ""} in ${elapsed} ms`);
+
+  if (r.spawnError) {
+    if (r.spawnError.code === "ENOENT") {
       throw new Error(
         `Executable '${file}' not found. Check CALIBREDB_PATH / EBOOK_CONVERT_PATH / ` +
           `FETCH_EBOOK_METADATA_PATH. On Windows they are usually in ` +
           `'C:\\Program Files\\Calibre2\\'.`,
       );
     }
-    if (err?.killed) {
-      throw new Error(
-        "The Calibre operation timed out. If the Calibre app is open it may be locking " +
-          "the library: close it or use the Content Server.",
-      );
-    }
-    const msg = String(err?.stderr || err?.stdout || err?.message || err).trim();
+    throw new Error(`Could not start '${basename(file)}': ${r.spawnError.message}`);
+  }
+  if (r.timedOut) {
+    throw new Error(
+      `The Calibre operation timed out after ${Math.round(timeoutMs / 1000)} s and was stopped. ` +
+        "If the Calibre app is open it may be locking the library: close it or use the Content Server.",
+    );
+  }
+  if (r.overflow) {
+    throw new Error(`'${basename(file)}' produced more than ${MAX_OUTPUT_BYTES / (1024 * 1024)} MB of output and was stopped.`);
+  }
+  if (r.code !== 0) {
+    const msg = (r.stderr || r.stdout || `exit code ${r.code}`).trim();
     if (/is running|another calibre/i.test(msg)) {
       throw new Error(
         msg +
@@ -97,6 +220,7 @@ export async function run(file: string, args: string[], opts: RunOptions = {}): 
     }
     throw new Error(`calibredb error: ${msg}`);
   }
+  return r.stdout;
 }
 
 /** Runs calibredb with the base arguments plus the given ones. */

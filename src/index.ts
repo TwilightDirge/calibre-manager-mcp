@@ -17,11 +17,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { tmpdir, homedir } from "node:os";
+import { spawn } from "node:child_process";
+import { join, dirname, basename } from "node:path";
 import { createHash } from "node:crypto";
 import sharp from "sharp";
-import { writeFileSync, existsSync, mkdtempSync, readFileSync, statSync} from "node:fs";
+import { writeFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, statSync} from "node:fs";
 
 import {
   CONFIG,
@@ -33,6 +34,52 @@ import {
 } from "./calibre.js";
 
 const server = new McpServer({ name: "calibre-manager", version: "0.1.0" });
+
+// --------------------------------------------------------------------------- //
+// Per-call logging
+// --------------------------------------------------------------------------- //
+// Every tool call writes a start line and an end line (with duration and
+// outcome) to stderr. Claude Desktop copies stderr into
+// mcp-server-calibre-manager.log, so a call that never finishes shows up as a
+// "start" with no matching "end", and a call that never reached the server
+// leaves no line at all.
+let callSeq = 0;
+
+function logLine(text: string): void {
+  console.error(`${new Date().toISOString()} [calibre-manager] ${text}`);
+}
+
+function summariseArgs(args: unknown): string {
+  try {
+    const text = JSON.stringify(args) ?? "";
+    return text.length > 300 ? `${text.slice(0, 300)}...` : text;
+  } catch {
+    return "(unserialisable args)";
+  }
+}
+
+{
+  const registerTool = server.tool.bind(server) as unknown as (...a: any[]) => unknown;
+  (server as any).tool = (name: string, ...rest: any[]) => {
+    const handler = rest.pop();
+    if (typeof handler !== "function") return registerTool(name, ...rest, handler);
+    const logged = async (...callArgs: any[]) => {
+      const n = ++callSeq;
+      const started = Date.now();
+      logLine(`#${n} start ${name} ${summariseArgs(callArgs[0])}`);
+      try {
+        const result = await handler(...callArgs);
+        const outcome = result?.isError ? "error" : "ok";
+        logLine(`#${n} end ${name} ${outcome} in ${Date.now() - started} ms`);
+        return result;
+      } catch (err: any) {
+        logLine(`#${n} end ${name} threw in ${Date.now() - started} ms: ${String(err?.message ?? err)}`);
+        throw err;
+      }
+    };
+    return registerTool(name, ...rest, logged);
+  };
+}
 
 type TextContent = { type: "text"; text: string };
 type ImageContent = { type: "image"; data: string; mimeType: string };
@@ -347,12 +394,34 @@ function sheetLabel(text: string, width: number, height: number): Buffer {
 type SheetItem = { id: number; title: string; cover: string };
 type SheetEntry = { pos: string; id: number; title: string; size?: string; ratio?: number; note?: string };
 
+// Every sheet is also saved as a file so it can be opened outside the chat.
+// Folder: CALIBRE_SHEET_DIR, or Pictures\Calibre contact sheets in your home folder.
+function saveSheet(jpeg: Buffer): string {
+  const dir = process.env.CALIBRE_SHEET_DIR || join(homedir(), "Pictures", "Calibre contact sheets");
+  mkdirSync(dir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+  let path = join(dir, `contact-sheet-${stamp}.jpg`);
+  for (let n = 2; existsSync(path); n++) path = join(dir, `contact-sheet-${stamp}-${n}.jpg`);
+  writeFileSync(path, jpeg);
+  return path;
+}
+
+// Opens a file in the default image viewer (Windows, macOS or Linux).
+function openFile(path: string): void {
+  const [cmd, args]: [string, string[]] =
+    process.platform === "win32" ? ["explorer.exe", [path]] :
+    process.platform === "darwin" ? ["open", [path]] : ["xdg-open", [path]];
+  const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
+  child.on("error", () => {});
+  child.unref();
+}
+
 // Builds the sheet image and the matching tile list.
 async function buildContactSheet(
   items: SheetItem[],
   columns: number,
   thumbW: number,
-): Promise<{ jpeg: Buffer; entries: SheetEntry[]; quality: number }> {
+): Promise<{ jpeg: Buffer; full: Buffer; entries: SheetEntry[]; quality: number }> {
   const thumbH = Math.round(thumbW * 1.5);
   const labelH = Math.max(18, Math.round(thumbW / 6));
   const gap = 6;
@@ -425,12 +494,14 @@ async function buildContactSheet(
     jpeg = await sharp(base).jpeg({ quality: q, mozjpeg: true }).toBuffer();
     if (jpeg.length <= MAX_SHEET_BYTES) break;
   }
-  return { jpeg, entries, quality };
+  // Better-quality copy for saving to disk; the one returned to Claude stays size-limited.
+  const full = await sharp(base).jpeg({ quality: 90, mozjpeg: true }).toBuffer();
+  return { jpeg, full, entries, quality };
 }
 
 server.tool(
   "contact_sheet",
-  `Returns ONE image tiling up to ${MAX_SHEET_COVERS} library covers as labelled thumbnails (read-only), plus a text list of each tile's position, id, title and original size. Covers are letterboxed on grey so their proportions stay visible; a red tile means no cover or an unreadable one. Give book_ids, or a Calibre query (paged with offset). With a query, page_ratio keeps only covers at or above that width/height ratio.`,
+  `Returns ONE image tiling up to ${MAX_SHEET_COVERS} library covers as labelled thumbnails (read-only; the sheet is also saved as a JPEG file, and open=true shows it to the user), plus a text list of each tile's position, id, title and original size. Covers are letterboxed on grey so their proportions stay visible; a red tile means no cover or an unreadable one. Give book_ids, or a Calibre query (paged with offset). With a query, page_ratio keeps only covers at or above that width/height ratio.`,
   {
     book_ids: z.string().optional().describe(`Comma-separated book ids (max ${MAX_SHEET_COVERS}), shown in the order given.`),
     query: z.string().optional().describe("Calibre query instead of ids, e.g. 'id:>=600 and id:<1000'. Results are sorted by id."),
@@ -439,8 +510,9 @@ server.tool(
     count: z.number().int().min(1).max(MAX_SHEET_COVERS).optional().describe(`How many covers to show (default and max ${MAX_SHEET_COVERS}).`),
     columns: z.number().int().min(2).max(12).optional().describe("Tiles per row (default 8)."),
     thumb_width: z.number().int().min(80).max(300).optional().describe("Width of each thumbnail in pixels (default 140)."),
+    open: z.boolean().optional().describe("true to also open the saved sheet in the user's image viewer, so they can see it outside the chat (default false). The sheet is always saved to a file; its path is in the result."),
   },
-  async ({ book_ids, query, offset, page_ratio, count, columns, thumb_width }) =>
+  async ({ book_ids, query, offset, page_ratio, count, columns, thumb_width, open }) =>
     guard(async () => {
       if (!book_ids && query === undefined) throw new Error("Provide book_ids or a query.");
       if (book_ids && query !== undefined) throw new Error("Provide book_ids or a query, not both.");
@@ -481,13 +553,15 @@ server.tool(
 
       if (!items.length) return { content: [{ type: "text", text: `${JSON.stringify(paging)}; nothing to show` }] };
 
-      const { jpeg, entries, quality } = await buildContactSheet(items, columns ?? 8, thumb_width ?? 140);
+      const { jpeg, full, entries, quality } = await buildContactSheet(items, columns ?? 8, thumb_width ?? 140);
+      const savedPath = saveSheet(full);
+      if (open) openFile(savedPath);
       const lines = entries.map(
         (e) => `${e.pos} #${e.id} ${e.size ? `${e.size} (${e.ratio})` : `[${e.note}]`} ${e.title}`,
       );
       const header = book_ids ? `${entries.length} covers` : `${JSON.stringify(paging)}`;
       const content: ToolResult["content"] = [
-        { type: "text", text: `${header}; jpeg quality ${quality}\n${lines.join("\n")}` },
+        { type: "text", text: `${header}; jpeg quality ${quality}\nsaved: ${savedPath}${open ? " (opened)" : ""}\n${lines.join("\n")}` },
         { type: "image", data: jpeg.toString("base64"), mimeType: "image/jpeg" },
       ];
       return { content };
@@ -519,11 +593,40 @@ server.tool(
 );
 
 // --------------------------------------------------------------------------- //
+// Cover files
+// --------------------------------------------------------------------------- //
+//
+// resolveCover checks a cover value before it reaches calibredb (which reports
+// success even when the file doesn't exist). A local path must be an existing
+// image file. An https:// URL is downloaded to its own temp folder first.
+
+const MAX_COVER_DOWNLOAD_BYTES = 20_000_000;
+
+async function resolveCover(value: string): Promise<string> {
+  const v = value.trim().replace(/^"(.*)"$/, "$1");
+  if (/^https:\/\//i.test(v)) {
+    const res = await fetch(v, { headers: { "User-Agent": "Mozilla/5.0 (calibre-manager)" } });
+    if (!res.ok) throw new Error(`Cover download failed: HTTP ${res.status} for ${v}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > MAX_COVER_DOWNLOAD_BYTES) throw new Error(`Cover download is too large (${Math.round(buf.length / 1_000_000)} MB).`);
+    if (!imageMimeType(buf)) throw new Error(`The URL did not return a JPEG, PNG, WebP or GIF image: ${v}`);
+    const dir = mkdtempSync(join(tmpdir(), "calibre-cover-"));
+    const path = join(dir, "cover.jpg");
+    writeFileSync(path, buf);
+    return path;
+  }
+  if (/^[a-z]+:\/\//i.test(v)) throw new Error(`Only https:// cover URLs are supported: ${v}`);
+  if (!existsSync(v) || !statSync(v).isFile()) throw new Error(`Cover file not found: ${v}`);
+  if (!imageMimeType(readFileSync(v))) throw new Error(`Cover file is not a JPEG, PNG, WebP or GIF image: ${v}`);
+  return v;
+}
+
+// --------------------------------------------------------------------------- //
 // Metadata writing
 // --------------------------------------------------------------------------- //
 server.tool(
   "set_metadata",
-  "Sets (REPLACES) a book's metadata. 'fields' is an object of field:value pairs. Fields: title, title_sort, authors (multiple with ' & '), author_sort ('Last, First'), tags (comma-separated), series, series_index, publisher, pubdate ('2020-01-01'), languages ('eng'/'spa'), rating (0–10, where 10 = 5 stars), comments (HTML allowed), identifiers ('isbn:9788491050000'), cover (path to an image). NOTE: it replaces the whole field value; to keep the other tags use add_tags/remove_tags.",
+  "Sets (REPLACES) a book's metadata. 'fields' is an object of field:value pairs. Fields: title, title_sort, authors (multiple with ' & '), author_sort ('Last, First'), tags (comma-separated), series, series_index, publisher, pubdate ('2020-01-01'), languages ('eng'/'spa'), rating (0–10, where 10 = 5 stars), comments (HTML allowed), identifiers ('isbn:9788491050000'), cover (path to an image file, or an https:// image URL, which is downloaded first; an error is returned if the file is missing or not an image). NOTE: it replaces the whole field value; to keep the other tags use add_tags/remove_tags.",
   {
     book_id: z.number().int().describe("The book's id."),
     fields: z.record(z.string(), z.string()).describe("Object with field:value pairs to set."),
@@ -533,7 +636,11 @@ server.tool(
       const entries = Object.entries(fields);
       if (!entries.length) throw new Error("No fields provided to change.");
       const args = ["set_metadata", String(book_id)];
-      for (const [key, value] of entries) args.push("--field", `${key}:${value}`);
+      for (const [key, value] of entries) {
+        // calibredb silently ignores a cover path that doesn't exist, so check it first.
+        const v = key === "cover" ? await resolveCover(value) : value;
+        args.push("--field", `${key}:${v}`);
+      }
       await calibredb(args);
       const books = await booksFrom(`id:${book_id}`, "all");
       return J(books[0] ?? { book_id, updated: true });
@@ -766,8 +873,41 @@ server.tool(
 // fetch_online_metadata saves each cover to its own new temp folder (so an old
 // image can never be reused by a later lookup), returns the cover image with the
 // OPF so it can be checked before use, and says so when no cover was found.
-// "sources" limits which metadata sources are used (fetch-ebook-metadata
-// --allowed-plugin).
+// The lookup runs fetch_meta.py under calibre-debug instead of
+// fetch-ebook-metadata, because fetch-ebook-metadata applies --allowed-plugin
+// only to the metadata step: its cover step asks every enabled cover source,
+// which returned covers of other books by the same author. fetch_meta.py uses
+// the same "sources" list for both steps and reports which source supplied the
+// cover. It lives in the repo root (one folder above the built index.js); set
+// CALIBRE_FETCH_SCRIPT to use a different location.
+
+const RESULT_MARKER = "@@CALIBRE_MANAGER_RESULT@@";
+
+// calibre-debug sits in the same folder as fetch-ebook-metadata.
+function calibreDebugPath(): string {
+  const fetchMeta = CONFIG.fetchMeta;
+  const name = basename(fetchMeta).toLowerCase().endsWith(".exe") ? "calibre-debug.exe" : "calibre-debug";
+  const dir = dirname(fetchMeta);
+  return dir === "." ? name : join(dir, name);
+}
+
+function fetchScriptPath(): string {
+  const p = process.env.CALIBRE_FETCH_SCRIPT || join(dirname(process.argv[1] ?? "."), "..", "fetch_meta.py");
+  if (!existsSync(p)) throw new Error(`fetch_meta.py not found at ${p}. Put it in the repo root or set CALIBRE_FETCH_SCRIPT.`);
+  return p;
+}
+
+type FetchResult = {
+  ok: boolean;
+  opf?: string;
+  cover_path?: string;
+  cover_source?: string;
+  cover_width?: number;
+  cover_height?: number;
+  cover_error?: string;
+  error?: string;
+  log?: string;
+};
 
 const MAX_IMAGE_BYTES = 3_000_000; // don't attach unusually large images
 
@@ -791,45 +931,51 @@ server.tool("fetch_online_metadata", "Looks up metadata from online sources by t
     isbn: z.string().optional(),
     apply_to_book_id: z.number().int().optional().describe("If set, applies the metadata to that book."),
     fetch_cover: z.boolean().optional().describe("true to also download the cover."),
-    sources: z.string().optional().describe("Comma-separated metadata source names to use, e.g. 'Goodreads,FictionDB'. Default: all enabled sources."),
+    sources: z.string().describe("Comma-separated source names, most preferred first, e.g. 'Hardcover,FictionDB'. Used for both the metadata and the cover; the cover comes from the first listed source that has one."),
     preview_width: z.number().int().min(0).max(1000).optional().describe("Width in pixels of the cover preview returned with fetch_cover (default 300). 0 returns the full-size image. The saved cover_path file is always full size."),
 }, async ({ title, authors, isbn, apply_to_book_id, fetch_cover, sources, preview_width }) => guard(async () => {
     if (!title && !isbn)
         throw new Error("Provide at least a title or an ISBN.");
-    const args: string[] = ["--opf"];
+    const sourceList = (sources ?? "").split(",").map((x: string) => x.trim()).filter(Boolean);
+    if (!sourceList.length)
+        throw new Error("Provide 'sources', e.g. 'Hardcover,FictionDB' (most preferred first).");
+    const args: string[] = ["-e", fetchScriptPath(), "--", "--sources", sourceList.join(",")];
     if (title)
         args.push("--title", title);
     if (authors)
         args.push("--authors", authors);
     if (isbn)
         args.push("--isbn", isbn);
-    if (sources) {
-        for (const s of sources.split(",").map((x: string) => x.trim()).filter(Boolean))
-            args.push("--allowed-plugin", s);
-    }
 
     let coverPath = "";
     if (fetch_cover) {
         const dir = mkdtempSync(join(tmpdir(), "calibre-cover-"));
         coverPath = join(dir, "cover.jpg");
-        args.push("--cover", coverPath);
+        args.push("--cover-out", coverPath);
     }
 
-    const opf = await run(CONFIG.fetchMeta, args, { timeout: 180_000 });
-    const haveCover = coverPath !== "" && existsSync(coverPath) && statSync(coverPath).size > 0;
+    const stdout = await run(calibreDebugPath(), args, { timeout: 180_000 });
+    const line = stdout.split(/\r?\n/).find((l: string) => l.startsWith(RESULT_MARKER));
+    if (!line)
+        throw new Error(`fetch_meta.py gave no result. Output:\n${stdout.slice(-3000)}`);
+    const res = JSON.parse(line.slice(RESULT_MARKER.length)) as FetchResult;
+    if (!res.ok || !res.opf)
+        throw new Error(`${res.error ?? "Lookup failed"}${res.log ? `\n${res.log}` : ""}`);
+    const opf = res.opf;
+    const haveCover = coverPath !== "" && !!res.cover_path && existsSync(coverPath) && statSync(coverPath).size > 0;
 
     // Lookup only: return the OPF plus (optionally) the cover image.
     if (!apply_to_book_id) {
         const content: ToolResult["content"] = [{ type: "text", text: opf }];
         if (fetch_cover) {
             if (!haveCover) {
-                content.push({ type: "text", text: "cover: none found" });
+                content.push({ type: "text", text: `cover: none found${res.cover_error ? ` (${res.cover_error})` : ""}` });
             } else {
                 const buf = readFileSync(coverPath);
                 const mimeType = imageMimeType(buf);
                 const size = imageSize(buf);
                 const sizeText = size ? `${size.width}x${size.height}` : "unknown size";
-                content.push({ type: "text", text: `cover_path: ${coverPath}\ncover_size: ${sizeText}, ${Math.round(buf.length / 1024)} KB` });
+                content.push({ type: "text", text: `cover_path: ${coverPath}\ncover_source: ${res.cover_source ?? "unknown"}\ncover_size: ${sizeText}, ${Math.round(buf.length / 1024)} KB` });
                 const width = preview_width ?? 300;
                 let preview: Buffer | null = null;
                 if (width > 0) {
