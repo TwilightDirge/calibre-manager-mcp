@@ -362,7 +362,8 @@ async function buildContactSheet(
   const sheetH = gap + rows * (thumbH + labelH + gap);
 
   const entries: SheetEntry[] = [];
-    const layers: Exclude<Parameters<ReturnType<typeof sharp>["composite"]>[0], undefined> = [];
+  // Element type of sharp().composite()'s argument, without naming sharp's namespace.
+  const layers: Exclude<Parameters<ReturnType<typeof sharp>["composite"]>[0], undefined> = [];
 
   const tiles = await Promise.all(
     items.map(async (item) => {
@@ -784,14 +785,15 @@ function imageMimeType(buf: Buffer): string | null {
     return null;
 }
 
-server.tool("fetch_online_metadata", "Looks up metadata from online sources by title/author or ISBN and returns an OPF. With fetch_cover=true, also returns the downloaded cover image and a unique cover_path that can be passed to set_metadata's cover field. If you pass apply_to_book_id, it applies that metadata (and optionally the cover) to that book in your library.", {
+server.tool("fetch_online_metadata", "Looks up metadata from online sources by title/author or ISBN and returns an OPF. With fetch_cover=true, also returns a small preview of the downloaded cover (its full size is reported), and a unique cover_path to the full-size file that can be passed to set_metadata's cover field. If you pass apply_to_book_id, it applies that metadata (and optionally the cover) to that book in your library.", {
     title: z.string().optional(),
     authors: z.string().optional(),
     isbn: z.string().optional(),
     apply_to_book_id: z.number().int().optional().describe("If set, applies the metadata to that book."),
     fetch_cover: z.boolean().optional().describe("true to also download the cover."),
     sources: z.string().optional().describe("Comma-separated metadata source names to use, e.g. 'Goodreads,FictionDB'. Default: all enabled sources."),
-}, async ({ title, authors, isbn, apply_to_book_id, fetch_cover, sources }) => guard(async () => {
+    preview_width: z.number().int().min(0).max(1000).optional().describe("Width in pixels of the cover preview returned with fetch_cover (default 300). 0 returns the full-size image. The saved cover_path file is always full size."),
+}, async ({ title, authors, isbn, apply_to_book_id, fetch_cover, sources, preview_width }) => guard(async () => {
     if (!title && !isbn)
         throw new Error("Provide at least a title or an ISBN.");
     const args: string[] = ["--opf"];
@@ -825,8 +827,26 @@ server.tool("fetch_online_metadata", "Looks up metadata from online sources by t
             } else {
                 const buf = readFileSync(coverPath);
                 const mimeType = imageMimeType(buf);
-                content.push({ type: "text", text: `cover_path: ${coverPath}` });
-                if (mimeType && buf.length <= MAX_IMAGE_BYTES)
+                const size = imageSize(buf);
+                const sizeText = size ? `${size.width}x${size.height}` : "unknown size";
+                content.push({ type: "text", text: `cover_path: ${coverPath}\ncover_size: ${sizeText}, ${Math.round(buf.length / 1024)} KB` });
+                const width = preview_width ?? 300;
+                let preview: Buffer | null = null;
+                if (width > 0) {
+                    try {
+                        // Small preview for checking the cover; the full-size file stays at cover_path.
+                        preview = await sharp(buf, { failOn: "none" })
+                            .resize({ width, height: width * 2, fit: "inside", withoutEnlargement: true })
+                            .flatten({ background: { r: 255, g: 255, b: 255 } })
+                            .jpeg({ quality: 80 })
+                            .toBuffer();
+                    } catch {
+                        preview = null;
+                    }
+                }
+                if (preview)
+                    content.push({ type: "image", data: preview.toString("base64"), mimeType: "image/jpeg" });
+                else if (mimeType && buf.length <= MAX_IMAGE_BYTES)
                     content.push({ type: "image", data: buf.toString("base64"), mimeType });
                 else
                     content.push({ type: "text", text: "cover image not attached (unrecognised format or too large)" });
